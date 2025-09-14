@@ -1,0 +1,1238 @@
+import time
+import json
+import requests
+import ccxt
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from io import BytesIO
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
+import threading
+import mplfinance as mpf
+import os
+import logging
+from typing import Dict, List, Optional, Tuple
+from dotenv import load_dotenv
+
+# بارگذاری متغیرهای محیطی
+load_dotenv()
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
+if not MAIN_BOT_TOKEN:
+    raise ValueError("MAIN_BOT_TOKEN environment variable not set")
+
+# ===============================
+# تنظیمات پیشرفته
+# ===============================
+POSITIONS_FILE = "positions.json"
+RISK_PERCENT = 1.0
+MIN_TRADE_VALUE = 11.5427  # ≈ 0.0001 BTC (حداقل سفارش بر اساس قوانین کوینکس)
+# پارامترهای سیستم سوئیچینگ
+MIN_HOLD_MINUTES = 10
+SWITCH_MARGIN = 0.05
+MAX_SWITCHES_PER_HOUR = 4
+SCORE_THRESHOLD = 0.6
+VOLUME_THRESHOLD = 1000000  # 1M USD
+# وزن‌های سیستم امتیازدهی
+WEIGHT_VOLATILITY = 0.35
+WEIGHT_LIQUIDITY = 0.30
+WEIGHT_MOMENTUM = 0.20
+WEIGHT_PATTERN = 0.15
+# تایم فریم ها
+TIMEFRAMES = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400
+}
+# استراتژی
+REQUIRE_ALL_CONFIRMATIONS = True
+RSI_BULL, RSI_BEAR = 55.0, 45.0
+EMA_FAST, EMA_SLOW = 50, 200
+MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
+BB_WINDOW, BB_DEV = 20, 2
+ATR_WINDOW = 14
+ATR_SL_MULTIPLIER = 1.5
+ATR_TP_MULTIPLIERS = [1.0, 2.0, 3.0]
+# متغیرهای سیستم
+is_running = False
+current_symbol = None
+current_position = None
+switch_count = 0
+last_switch_time = datetime.now()
+symbol_scores = {}
+market_data = {}
+previous_signals = {}
+last_run = {tf: 0 for tf in TIMEFRAMES}
+# مدیریت سرمایه
+waiting_for_wallet_balance = False
+waiting_for_trading_percentage = False
+# تنظیمات لاگ‌گیری
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ===============================
+# 1. مدیریت فایل پوزیشن
+# ===============================
+def load_positions(chat_id):
+    filename = f"positions_{chat_id}.json"
+    try:
+        if not os.path.exists(filename):
+            return {"positions": [], "wallet_balance": None, "trading_capital": None, "capital": None}
+        with open(filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for key in ["wallet_balance", "trading_capital", "capital"]:
+                if key not in data:
+                    data[key] = None
+            for pos in data.get("positions", []):
+                pos.setdefault("volume", 0.0)
+                pos.setdefault("entry", 0.0)
+                pos.setdefault("sl", 0.0)
+                pos.setdefault("tps", [])
+                pos.setdefault("profit_dollar", 0.0)
+                pos.setdefault("hit_tps", [])
+                pos.setdefault("tp_times", {})
+                pos.setdefault("sl_time", None)
+                pos.setdefault("close_time", None)
+            return data
+    except Exception as e:
+        logger.error(f"خطا در بارگیری پوزیشن‌ها برای کاربر {chat_id}: {e}")
+        return {"positions": [], "wallet_balance": None, "trading_capital": None, "capital": None}
+
+def save_positions(data, chat_id):
+    filename = f"positions_{chat_id}.json"
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"خطا در ذخیره پوزیشن‌ها برای کاربر {chat_id}: {e}")
+
+# ===============================
+# 2. مدیریت داده بازار
+# ===============================
+class MarketData:
+    def __init__(self):
+        self.symbols = []
+        self.ohlcv_data = {}
+        self.market_metrics = {}
+        self.last_update = {}
+    
+    def fetch_all_symbols(self, exchange, min_volume=VOLUME_THRESHOLD):
+        """دریافت تمام نمادها با فیلتر حجم"""
+        try:
+            markets = exchange.load_markets()
+            valid_symbols = []
+            for symbol, market in markets.items():
+                if market.get('quote') == 'USDT' and market.get('active', False):
+                    volume_str = market.get('info', {}).get('volumeQuote', '0')
+                    try:
+                        volume_float = float(volume_str.replace(',', '')) if isinstance(volume_str, str) else float(volume_str)
+                    except ValueError:
+                        volume_float = 0.0
+                    if volume_float >= min_volume:
+                        valid_symbols.append(symbol)
+            self.symbols = valid_symbols[:50]
+            logger.info(f"Found {len(self.symbols)} symbols with sufficient volume")
+            if len(self.symbols) == 0:
+                logger.warning(f"No symbols found above volume threshold of {min_volume:,.0f} USD")
+            return self.symbols
+        except Exception as e:
+            logger.error(f"Error fetching symbols: {e}")
+            return []
+    
+    def fetch_ohlcv_data(self, exchange, symbols, timeframe='1h', limit=100):
+        """دریافت داده OHLCV برای نمادها"""
+        ohlcv_data = {}
+        for symbol in symbols:
+            try:
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                ohlcv_data[symbol] = df
+                self.last_update[symbol] = datetime.now()
+            except Exception as e:
+                logger.error(f"Error fetching OHLCV for {symbol}: {e}")
+        self.ohlcv_data = ohlcv_data
+        return ohlcv_data
+    
+    def calculate_market_metrics(self):
+        """محاسبه معیارهای بازار برای تمام نمادها"""
+        market_metrics = {}
+        atr_values = []
+        volume_values = []
+        for symbol, df in self.ohlcv_data.items():
+            try:
+                atr = self.calculate_atr(df)
+                atr_values.append(atr)
+                volume = df['volume'].mean()
+                volume_values.append(volume)
+                momentum = self.calculate_momentum(df)
+                pattern_score = self.calculate_pattern_score(df)
+                market_metrics[symbol] = {
+                    'atr': atr,
+                    'volume': volume,
+                    'momentum': momentum,
+                    'pattern_score': pattern_score
+                }
+            except Exception as e:
+                logger.error(f"Error calculating metrics for {symbol}: {e}")
+        avg_atr = np.mean(atr_values) if atr_values else 1
+        avg_volume = np.mean(volume_values) if volume_values else 1
+        self.market_metrics = market_metrics
+        return market_metrics, avg_atr, avg_volume
+    
+    def calculate_atr(self, df, window=14):
+        try:
+            high = df['high']
+            low = df['low']
+            close = df['close']
+            tr = np.maximum(high - low, 
+                           np.maximum(abs(high - close.shift()), 
+                                     abs(low - close.shift())))
+            atr = tr.rolling(window=window).mean().iloc[-1]
+            return atr
+        except:
+            return 0
+    
+    def calculate_momentum(self, df, periods=[5, 10, 20]):
+        try:
+            close = df['close']
+            momentum_scores = []
+            for period in periods:
+                returns = (close.iloc[-1] / close.iloc[-period] - 1) * 100
+                momentum_scores.append(returns)
+            return np.mean(momentum_scores)
+        except:
+            return 0
+    
+    def calculate_pattern_score(self, df):
+        try:
+            score = 0
+            recent_high = df['high'].iloc[-5:].max()
+            if df['close'].iloc[-1] > recent_high:
+                score += 0.3
+            rsi = RSIIndicator(df['close'], window=14).rsi().iloc[-1]
+            if 50 < rsi < 70:
+                score += 0.2
+            elif rsi > 70:
+                score -= 0.1
+            macd_ind = MACD(df['close'], window_fast=12, window_slow=26, window_sign=9)
+            macd = macd_ind.macd().iloc[-1]
+            signal = macd_ind.macd_signal().iloc[-1]
+            if macd > signal:
+                score += 0.2
+            ema_fast = EMAIndicator(df['close'], window=50).ema_indicator().iloc[-1]
+            ema_slow = EMAIndicator(df['close'], window=200).ema_indicator().iloc[-1]
+            if ema_fast > ema_slow:
+                score += 0.3
+            return max(0, min(1, score))
+        except Exception as e:
+            logger.error(f"Error calculating pattern score: {e}")
+            return 0
+
+# ===============================
+# 3. سیستم امتیازدهی
+# ===============================
+class ScoringSystem:
+    def __init__(self, weight_volatility=0.35, weight_liquidity=0.30, 
+                 weight_momentum=0.20, weight_pattern=0.15):
+        self.weights = {
+            'volatility': weight_volatility,
+            'liquidity': weight_liquidity,
+            'momentum': weight_momentum,
+            'pattern': weight_pattern
+        }
+    
+    def calculate_score(self, symbol_metrics, avg_atr, avg_volume):
+        try:
+            vol_norm = self.normalize_volatility(symbol_metrics['atr'], avg_atr)
+            liq_norm = self.normalize_liquidity(symbol_metrics['volume'], avg_volume)
+            mom_norm = self.normalize_momentum(symbol_metrics['momentum'])
+            pattern_score = symbol_metrics['pattern_score']
+            score = (self.weights['volatility'] * vol_norm +
+                    self.weights['liquidity'] * liq_norm +
+                    self.weights['momentum'] * mom_norm +
+                    self.weights['pattern'] * pattern_score)
+            return max(0, min(1, score))
+        except Exception as e:
+            logger.error(f"Error calculating score for {symbol_metrics}: {e}")
+            return 0
+    
+    def normalize_volatility(self, atr, avg_atr):
+        if avg_atr == 0:
+            return 0
+        ratio = atr / avg_atr
+        return min(1.0, ratio / 2.0)
+    
+    def normalize_liquidity(self, volume, avg_volume):
+        if avg_volume == 0:
+            return 0
+        try:
+            log_volume = np.log10(volume)
+            log_avg = np.log10(avg_volume)
+            log_threshold = np.log10(VOLUME_THRESHOLD)
+            if log_volume >= log_threshold:
+                return 1.0
+            else:
+                return max(0, min(1, (log_volume - log_avg) / (log_threshold - log_avg)))
+        except:
+            return 0
+    
+    def normalize_momentum(self, momentum):
+        return max(0, min(1, (momentum + 20) / 40))
+
+# ===============================
+# 4. مدیریت پوزیشن و سوئیچینگ
+# ===============================
+class PositionManager:
+    def __init__(self):
+        self.current_symbol = None
+        self.entry_time = None
+        self.entry_price = None
+        self.position_size = 0
+        self.stop_loss = 0
+        self.take_profit = 0
+        self.initial_atr = 0
+        self.initial_volume = 0
+    
+    def should_switch(self, new_score, current_score, market_data):
+        if self.current_symbol is None:
+            return True
+        if self.entry_time and (datetime.now() - self.entry_time).total_seconds() < MIN_HOLD_MINUTES * 60:
+            return False
+        if new_score < current_score * (1 + SWITCH_MARGIN):
+            return False
+        if self.check_current_symbol_conditions(market_data):
+            return True
+        return False
+    
+    def check_current_symbol_conditions(self, market_data):
+        if self.current_symbol not in market_data.ohlcv_data:
+            return True
+        df = market_data.ohlcv_data[self.current_symbol]
+        current_atr = market_data.calculate_atr(df)
+        if current_atr < self.initial_atr * 0.7:
+            return True
+        current_volume = df['volume'].mean()
+        if current_volume < self.initial_volume * 0.5:
+            return True
+        if self.check_technical_exit(df):
+            return True
+        return False
+    
+    def check_technical_exit(self, df):
+        try:
+            rsi = RSIIndicator(df['close'], window=14).rsi().iloc[-1]
+            if rsi < 30 or rsi > 80:
+                return True
+            macd_ind = MACD(df['close'], window_fast=12, window_slow=26, window_sign=9)
+            macd = macd_ind.macd().iloc[-1]
+            signal = macd_ind.macd_signal().iloc[-1]
+            if macd < signal:
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error checking technical exit: {e}")
+            return False
+
+# ===============================
+# 5. ارسال پیام و چارت به تلگرام
+# ===============================
+def send_message(chat_id, text, reply_markup=None, bot_token=None):
+    try:
+        # اگر توکن داده نشده، از کاربر فعلی بگیر
+        if bot_token is None:
+            users_data = load_users()
+            user = users_data.get(str(chat_id))
+            if not user:
+                # اگر کاربر وجود ندارد، از توکن مرکزی استفاده کن
+                bot_token = MAIN_BOT_TOKEN
+            else:
+                bot_token = user["telegram_token"]
+        
+        if len(text) > 4000:
+            text = text[:4000] + "... (پیام کوتاه شد)"
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        response = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", data=data, timeout=15)
+        if not response.ok:
+            logger.error(f"خطا در ارسال پیام تلگرام به {chat_id}: {response.text}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"خطای ارسال پیام به {chat_id}: {e}")
+        return False
+
+def send_chart(chat_id, image_bytes, caption="", bot_token=None):
+    try:
+        # اگر توکن داده نشده، از کاربر فعلی بگیر
+        if bot_token is None:
+            users_data = load_users()
+            user = users_data.get(str(chat_id))
+            if not user:
+                # اگر کاربر وجود ندارد، از توکن مرکزی استفاده کن
+                bot_token = MAIN_BOT_TOKEN
+            else:
+                bot_token = user["telegram_token"]
+        
+        files = {"photo": image_bytes}
+        data = {"chat_id": chat_id, "caption": caption}
+        response = requests.post(f"https://api.telegram.org/bot{bot_token}/sendPhoto", data=data, files=files, timeout=30)
+        if not response.ok:
+            logger.error(f"خطا در ارسال چارت تلگرام به {chat_id}: {response.text}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"خطای ارسال چارت به {chat_id}: {e}")
+        return False
+
+# ===============================
+# 6. مدیریت کاربران
+# ===============================
+USERS_FILE = "users.json"
+
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return {}
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_users(users):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+def get_user_exchange(chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if not user:
+        return None
+    exchange_name = user["exchange"]
+    api_key = user["api_key"]
+    api_secret = user["api_secret"]
+    exchange_class = ccxt.coinex
+    exchange = exchange_class({
+        "apiKey": api_key,
+        "secret": api_secret,
+        "enableRateLimit": True,
+        "timeout": 30000,
+        "options": {"defaultType": "future" if user["trade_mode"] == "futures" else "spot"}
+    })
+    return exchange
+
+def fetch_ohlcv(symbol, timeframe, limit=400, chat_id=None):
+    if not chat_id:
+        return None
+    exchange = get_user_exchange(chat_id)
+    if not exchange:
+        return None
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.dropna(inplace=True)
+        return df
+    except Exception as e:
+        logger.error(f"خطا در دریافت داده {symbol}-{timeframe} برای کاربر {chat_id}: {e}")
+        return None
+
+def execute_order(symbol, side, amount, params=None, chat_id=None):
+    if not chat_id:
+        return None
+    exchange = get_user_exchange(chat_id)
+    if not exchange:
+        return None
+    params = params or {}
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if user["is_demo"]:
+        msg = f"🔹 Demo: Order {side.upper()} for {symbol} with volume {amount:.6f} simulated."
+        send_message(chat_id, msg, bot_token=user["telegram_token"])
+        return {"id": f"demo-{int(time.time())}"}
+
+    if exchange.name == "coinex" and side == "buy":
+        params['createMarketBuyOrderRequiresPrice'] = False
+    try:
+        order = exchange.create_market_order(symbol, side, amount, params=params)
+        return order
+    except Exception as e:
+        send_message(chat_id, f"❌ خطای اجرای سفارش: {str(e)}", bot_token=user["telegram_token"])
+        raise Exception(f"Execution failed: {e}")
+
+def place_futures_exit_orders(symbol, direction, volume, sl, tps, chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if user["is_demo"]:
+        return {"sl_id": f"demo-sl-{int(time.time())}", "tp_ids": [f"demo-tp-{i}" for i in range(len(tps))]}
+    
+    exchange = get_user_exchange(chat_id)
+    if not exchange:
+        return None
+    
+    try:
+        sl_side = "sell" if direction == "buy" else "buy"
+        sl_params = {
+            "stopPrice": sl, 
+            "triggerPrice": sl, 
+            "reduceOnly": True,
+            "margin_mode": "isolated"
+        }
+        sl_order = exchange.create_order(symbol, "stop_market", sl_side, volume, params=sl_params)
+        
+        tp_side = "sell" if direction == "buy" else "buy"
+        tp_volume = volume / len(tps)
+        tp_ids = []
+        for tp in tps:
+            tp_params = {
+                "reduceOnly": True,
+                "margin_mode": "isolated"
+            }
+            tp_order = exchange.create_limit_order(symbol, tp_side, tp_volume, tp, params=tp_params)
+            tp_ids.append(tp_order["id"])
+        return {"sl_id": sl_order["id"], "tp_ids": tp_ids}
+    except Exception as e:
+        logger.error(f"خطا در تنظیم سفارشات خروج برای کاربر {chat_id}: {e}")
+        return {"sl_id": None, "tp_ids": []}
+
+def calculate_volume(symbol, entry, sl, direction, chat_id):
+    distance = abs(entry - sl)
+    if distance <= 0:
+        return 0.0
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    risk_amount_usd = user["trading_capital"] * RISK_PERCENT / 100.0
+    if risk_amount_usd <= 0:
+        return 0.0
+    volume_base = risk_amount_usd / distance
+    notional_value = volume_base * entry
+    if notional_value < MIN_TRADE_VALUE:
+        volume_base = MIN_TRADE_VALUE / entry
+    return volume_base
+
+# ===============================
+# 7. رسم چارت‌های معاملاتی (نسخه داشبورد)
+# ===============================
+def plot_dashboard_chart(ind_df, symbol, timeframe, signal, position_data=None):
+    """
+    Plots a comprehensive dashboard chart including candles, indicators, and trade plan.
+    Args:
+        ind_df (pd.DataFrame): DataFrame with OHLCV and indicator data.
+        symbol (str): Trading pair symbol.
+        timeframe (str): Timeframe of the data.
+        signal (str): Trading signal (e.g., 'buy', 'sell').
+        position_data (dict, optional): Dictionary containing position details
+                                        (entry, sl, tps, direction, close_price).
+                                        Defaults to None.
+    """
+    df = ind_df.tail(100).copy()
+    df_mpf = df.set_index("time")[["open", "high", "low", "close", "volume"]]
+    df_mpf.index = pd.to_datetime(df_mpf.index)
+    add_plots = [
+        mpf.make_addplot(df["EMA_FAST"], color="blue", width=0.8),
+        mpf.make_addplot(df["EMA_SLOW"], color="red", width=0.8),
+        mpf.make_addplot(df["BB_HIGH"], color="orange", linestyle="--", alpha=0.7),
+        mpf.make_addplot(df["BB_LOW"], color="orange", linestyle="--", alpha=0.7),
+    ]
+    if position_data:
+        add_plots.append(mpf.make_addplot([position_data["entry"]] * len(df_mpf), color="blue", linestyle="--", width=0.8, panel=0))
+        add_plots.append(mpf.make_addplot([position_data["sl"]] * len(df_mpf), color="red", linestyle="--", width=0.8, panel=0))
+        for tp in position_data["tps"]:
+            add_plots.append(mpf.make_addplot([tp] * len(df_mpf), color="green", linestyle="--", width=0.8, panel=0))
+        if position_data.get("close_price"):
+            add_plots.append(mpf.make_addplot([position_data["close_price"]] * len(df_mpf), color="purple", linestyle="--", width=0.8, panel=0))
+    add_plots_volume_rsi = [
+        mpf.make_addplot(df["volume"], panel=1, color="gray", type="bar", ylabel="Volume"),
+        mpf.make_addplot(df["RSI"], panel=1, color="blue", ylabel="RSI"),
+    ]
+    add_plots_volume_rsi.extend([
+        mpf.make_addplot([70] * len(df_mpf), panel=1, color="red", linestyle="--", alpha=0.5),
+        mpf.make_addplot([30] * len(df_mpf), panel=1, color="green", linestyle="--", alpha=0.5),
+    ])
+    add_plots_macd = [
+        mpf.make_addplot(df["MACD"], panel=2, color="blue", ylabel="MACD"),
+        mpf.make_addplot(df["MACD_SIGNAL"], panel=2, color="orange"),
+    ]
+    add_plots_macd.append(mpf.make_addplot([0] * len(df_mpf), panel=2, color="black", linestyle="--", alpha=0.5))
+    all_add_plots = add_plots + add_plots_volume_rsi + add_plots_macd
+    mc = mpf.make_marketcolors(up="green", down="red", wick="black", edge="black")
+    s = mpf.make_mpf_style(marketcolors=mc)
+    fig, _ = mpf.plot(
+        df_mpf,
+        type="candle",
+        volume=False,
+        addplot=all_add_plots,
+        style=s,
+        title=f"{symbol} {timeframe} | {signal.upper()} | CoinEx",
+        panel_ratios=(6, 3, 2),
+        figratio=(14, 9),
+        returnfig=True
+    )
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ===============================
+# 8. محاسبه اندیکاتورها
+# ===============================
+def compute_indicators(df):
+    try:
+        out = df.copy()
+        out["EMA_FAST"] = EMAIndicator(close=out["close"], window=EMA_FAST).ema_indicator()
+        out["EMA_SLOW"] = EMAIndicator(close=out["close"], window=EMA_SLOW).ema_indicator()
+        out["RSI"] = RSIIndicator(close=out["close"], window=14).rsi()
+        macd_ind = MACD(close=out["close"], window_fast=MACD_FAST, window_slow=MACD_SLOW, window_sign=MACD_SIGNAL)
+        out["MACD"] = macd_ind.macd()
+        out["MACD_SIGNAL"] = macd_ind.macd_signal()
+        bb = BollingerBands(close=out["close"], window=BB_WINDOW, window_dev=BB_DEV)
+        out["BB_HIGH"] = bb.bollinger_hband()
+        out["BB_LOW"] = bb.bollinger_lband()
+        out["ATR"] = AverageTrueRange(high=out["high"], low=out["low"], close=out["close"], window=ATR_WINDOW).average_true_range()
+        out.dropna(inplace=True)
+        return out
+    except Exception as e:
+        logger.error(f"خطا در محاسبه اندیکاتور: {e}")
+        return None
+
+# ===============================
+# 9. تصمیم سیگنال
+# ===============================
+def decide_signal(row_prev, row):
+    ema_bull = row["EMA_FAST"] > row["EMA_SLOW"]
+    ema_bear = row["EMA_FAST"] < row["EMA_SLOW"]
+    rsi_bull = row["RSI"] > RSI_BULL
+    rsi_bear = row["RSI"] < RSI_BEAR
+    macd_bull = row["MACD"] > row["MACD_SIGNAL"]
+    macd_bear = row["MACD"] < row["MACD_SIGNAL"]
+    bull_confirms = [ema_bull, rsi_bull, macd_bull]
+    bear_confirms = [ema_bear, rsi_bear, macd_bear]
+    bull_ok = all(bull_confirms) if REQUIRE_ALL_CONFIRMATIONS else sum(bull_confirms) >= 2
+    bear_ok = all(bear_confirms) if REQUIRE_ALL_CONFIRMATIONS else sum(bear_confirms) >= 2
+    if bull_ok and not bear_ok:
+        return "buy", False
+    if bear_ok and not bull_ok:
+        return "sell", False
+    return "neutral", False
+
+# ===============================
+# 10. پیاده‌سازی ربات هوشمند
+# ===============================
+class SmartTradingBot:
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+        self.exchange = None
+        self.market_data = MarketData()
+        self.scoring_system = ScoringSystem()
+        self.position_manager = PositionManager()
+        self.symbol_scores = {}
+        self.users_data = load_users()
+        self.user = self.users_data.get(str(chat_id))
+    
+    def initialize(self):
+        try:
+            if not self.user:
+                logger.error(f"User {self.chat_id} not found")
+                return False
+            
+            self.exchange = get_user_exchange(self.chat_id)
+            if not self.exchange:
+                logger.error(f"Exchange not initialized for user {self.chat_id}")
+                return False
+            
+            symbols = self.market_data.fetch_all_symbols(self.exchange)
+            if not symbols:
+                logger.error("No valid symbols found")
+                return False
+            
+            self.market_data.fetch_ohlcv_data(self.exchange, symbols)
+            market_metrics, avg_atr, avg_volume = self.market_data.calculate_market_metrics()
+            for symbol, metrics in market_metrics.items():
+                score = self.scoring_system.calculate_score(metrics, avg_atr, avg_volume)
+                self.symbol_scores[symbol] = score
+            
+            logger.info(f"Bot initialized successfully for user {self.chat_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Initialization error for user {self.chat_id}: {e}")
+            return False
+    
+    def find_best_symbol(self):
+        if not self.symbol_scores:
+            return None, 0
+        sorted_symbols = sorted(self.symbol_scores.items(), key=lambda x: x[1], reverse=True)
+        for symbol, score in sorted_symbols:
+            if score >= SCORE_THRESHOLD:
+                return symbol, score
+        return None, 0
+    
+    def execute_trade(self, symbol):
+        try:
+            df = fetch_ohlcv(symbol, "1h", 200, self.chat_id)
+            if df is None:
+                return False
+            ind_df = compute_indicators(df)
+            if ind_df is None:
+                return False
+            row = ind_df.iloc[-1]
+            signal, _ = decide_signal(ind_df.iloc[-2], row)
+            if signal == "neutral":
+                return False
+            atr = row["ATR"]
+            entry_price = row["close"]
+            if signal == "buy":
+                sl_price = entry_price - atr * ATR_SL_MULTIPLIER
+                tp_prices = [entry_price + atr * mult for mult in ATR_TP_MULTIPLIERS]
+            else:
+                sl_price = entry_price + atr * ATR_SL_MULTIPLIER  
+                tp_prices = [entry_price - atr * mult for mult in ATR_TP_MULTIPLIERS]
+            volume = calculate_volume(symbol, entry_price, sl_price, signal, self.chat_id)
+            if volume * entry_price < MIN_TRADE_VALUE:
+                logger.warning(f"Trade size too small for {symbol}")
+                return False
+            self.position_manager.current_symbol = symbol
+            self.position_manager.entry_time = datetime.now()
+            self.position_manager.entry_price = entry_price
+            self.position_manager.position_size = volume
+            self.position_manager.initial_atr = atr
+            self.position_manager.initial_volume = df['volume'].mean()
+            self.position_manager.stop_loss = sl_price
+            self.position_manager.take_profit = tp_prices
+            signal_id = f"{symbol.replace('/', '')}-1h-{datetime.now().strftime('%Y%m%d-%H%M')}"
+            msg = f"""
+🚀 <b>Smart Switch Signal {signal.upper()}</b>
+📌 <b>{symbol}</b> | ⏱️ <b>1h</b> | 🏦 CoinEx
+💰 Entry: <code>{entry_price:.6f}</code>
+🛑 SL: <code>{sl_price:.6f}</code>  
+🎯 TP: {" | ".join(f"<code>{tp:.6f}</code>" for tp in tp_prices)}
+📊 ATR: <code>{atr:.6f}</code>
+🆔 Code: <code>{signal_id}</code>
+📦 Volume: <code>{volume:.6f}</code> ({volume * entry_price:.2f} USD)
+⭐ Score: <b>{self.symbol_scores.get(symbol, 0):.3f}</b>
+🎯 Risk: {RISK_PERCENT}%
+"""
+            send_message(self.chat_id, msg, bot_token=self.user["telegram_token"])
+            try:
+                position_data = {
+                    "entry": entry_price,
+                    "sl": sl_price,
+                    "tps": tp_prices,
+                    "direction": signal
+                }
+                chart_buf = plot_dashboard_chart(ind_df, symbol, "1h", signal, position_data=position_data)
+                send_chart(self.chat_id, chart_buf, f"🎯 {symbol}-1h Smart Switch Dashboard | Score: {self.symbol_scores.get(symbol, 0):.3f}", bot_token=self.user["telegram_token"])
+            except Exception as e:
+                logger.error(f"Chart error in execute_trade for user {self.chat_id}: {e}")
+            try:
+                order = execute_order(symbol, signal, volume, chat_id=self.chat_id)
+                send_message(self.chat_id, f"✅ Smart switch executed. Order ID: <code>{order['id']}</code>", bot_token=self.user["telegram_token"])
+                positions = load_positions(self.chat_id)
+                new_pos = {
+                    "id": signal_id,
+                    "symbol": symbol,
+                    "timeframe": "1h",
+                    "direction": signal,
+                    "entry": entry_price,
+                    "sl": sl_price,
+                    "tps": tp_prices,
+                    "volume": volume,
+                    "status": "open",
+                    "open_time": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                    "order_id": order["id"],
+                    "demo": self.user["is_demo"],
+                    "exchange": self.user["exchange"],
+                    "hit_tps": [],
+                    "tp_times": {},
+                    "sl_time": None,
+                    "close_time": None,
+                    "profit_dollar": 0.0,
+                    "score": self.symbol_scores.get(symbol, 0)
+                }
+                positions["positions"].append(new_pos)
+                save_positions(positions, self.chat_id)
+                logger.info(f"Switched to {symbol} with score {self.symbol_scores.get(symbol, 0):.3f} for user {self.chat_id}")
+                return True
+            except Exception as e:
+                send_message(self.chat_id, f"❌ Order execution error: {e}", bot_token=self.user["telegram_token"])
+                return False
+        except Exception as e:
+            logger.error(f"Trade execution error for user {self.chat_id}: {e}")
+            return False
+    
+    def run_cycle(self):
+        try:
+            self.market_data.fetch_ohlcv_data(self.exchange, self.market_data.symbols)
+            market_metrics, avg_atr, avg_volume = self.market_data.calculate_market_metrics()
+            for symbol, metrics in market_metrics.items():
+                score = self.scoring_system.calculate_score(metrics, avg_atr, avg_volume)
+                self.symbol_scores[symbol] = score
+            best_symbol, best_score = self.find_best_symbol()
+            if not best_symbol:
+                logger.info("No suitable symbol found above threshold")
+                return
+            current_score = self.symbol_scores.get(self.position_manager.current_symbol, 0)
+            if self.position_manager.should_switch(best_score, current_score, self.market_data):
+                if self.position_manager.current_symbol:
+                    self.close_position()
+                if self.execute_trade(best_symbol):
+                    logger.info(f"Successfully switched to {best_symbol} for user {self.chat_id}")
+            self.check_exit_conditions()
+        except Exception as e:
+            logger.error(f"Run cycle error for user {self.chat_id}: {e}")
+    
+    def close_position(self):
+        if self.position_manager.current_symbol:
+            symbol = self.position_manager.current_symbol
+            logger.info(f"Closing position in {symbol} for user {self.chat_id}")
+            send_message(self.chat_id, f"🔄 Switching from {symbol}", bot_token=self.user["telegram_token"])
+            self.position_manager.current_symbol = None
+            self.position_manager.entry_time = None
+    
+    def check_exit_conditions(self):
+        if not self.position_manager.current_symbol:
+            return
+        symbol = self.position_manager.current_symbol
+        df = fetch_ohlcv(symbol, "1h", 200, self.chat_id)
+        if df is None or df.empty:
+            return
+        current_price = df['close'].iloc[-1]
+        if current_price <= self.position_manager.stop_loss:
+            logger.info(f"Stop loss hit for {symbol} for user {self.chat_id}")
+            send_message(self.chat_id, f"🛑 Stop loss triggered for {symbol}", bot_token=self.user["telegram_token"])
+            self.close_position()
+            return
+        for i, tp_level in enumerate(self.position_manager.take_profit):
+            if current_price >= tp_level:
+                logger.info(f"Take profit {i+1} hit for {symbol} for user {self.chat_id}")
+                send_message(self.chat_id, f"🎯 Take profit {i+1} hit for {symbol}", bot_token=self.user["telegram_token"])
+                break
+        if self.position_manager.check_technical_exit(df):
+            logger.info(f"Technical exit signal for {symbol} for user {self.chat_id}")
+            send_message(self.chat_id, f"📉 Technical exit signal for {symbol}", bot_token=self.user["telegram_token"])
+            self.close_position()
+            return
+
+# ===============================
+# 11. مدیریت پیام‌های تلگرام
+# ===============================
+def manage_positions_tick(chat_id):
+    if not all_settings_completed(chat_id) or not is_running_for_user(chat_id):
+        return
+    positions = load_positions(chat_id)
+    changed = False
+    for pos in positions.get("positions", []):
+        if pos.get("status") != "open":
+            continue
+        symbol = pos["symbol"]
+        timeframe = pos["timeframe"]
+        direction = pos["direction"]
+        entry = float(pos["entry"])
+        sl = float(pos["sl"])
+        tps = [float(x) for x in pos.get("tps", [])]
+        volume = float(pos.get("volume", 0.0))
+        signal_id = pos["id"]
+        df = fetch_ohlcv(symbol, timeframe, 200, chat_id)
+        if df is None or df.empty:
+            continue
+        price = float(df["close"].iloc[-1])
+        current_time = df["time"].iloc[-1]
+        closed = False
+        close_price = None
+        pos.setdefault("profit_dollar", 0.0)
+        pos.setdefault("hit_tps", [])
+        pos.setdefault("tp_times", {})
+        tp_vol = volume / len(tps) if len(tps) > 0 else 0
+        sorted_tps = sorted(tps) if direction == "buy" else sorted(tps, reverse=True)
+        for tp in sorted_tps:
+            if tp in pos["hit_tps"]:
+                continue
+            hit_condition = (direction == "buy" and price >= tp) or (direction == "sell" and price <= tp)
+            if hit_condition:
+                tp_index = tps.index(tp) + 1
+                pos["tp_times"][f"TP{tp_index}"] = current_time.isoformat()
+                pos["hit_tps"].append(tp)
+                tp_pnl = (tp - entry) * tp_vol if direction == "buy" else (entry - tp) * tp_vol
+                pos["profit_dollar"] += tp_pnl
+                send_message(chat_id, f"✅ TP{tp_index} hit for {signal_id} | Profit: {tp_pnl:.2f} $ at {current_time}", bot_token=load_users().get(str(chat_id), {}).get("telegram_token"))
+                changed = True
+        if len(pos["hit_tps"]) == len(tps):
+            closed = True
+            close_price = tps[-1] if direction == "buy" else tps[0]
+            pos["close_time"] = current_time.isoformat()
+            send_message(chat_id, f"✅ Trade {signal_id} fully closed with profit", bot_token=load_users().get(str(chat_id), {}).get("telegram_token"))
+        if not closed:
+            sl_condition = (direction == "buy" and price <= sl) or (direction == "sell" and price >= sl)
+            if sl_condition:
+                pos["sl_time"] = current_time.isoformat()
+                remaining_vol = volume - (len(pos["hit_tps"]) * tp_vol)
+                sl_pnl = (sl - entry) * remaining_vol if direction == "buy" else (entry - sl) * remaining_vol
+                pos["profit_dollar"] += sl_pnl
+                send_message(chat_id, f"❌ SL hit for {signal_id} | Loss: {sl_pnl:.2f} $", bot_token=load_users().get(str(chat_id), {}).get("telegram_token"))
+                closed = True
+                close_price = sl
+                pos["close_time"] = current_time.isoformat()
+                changed = True
+        if closed:
+            pos["status"] = "closed"
+            pos["close_price"] = close_price
+            pos["profit_percent"] = pos["profit_dollar"] / load_users().get(str(chat_id), {}).get("trading_capital", 0) * 100 if load_users().get(str(chat_id), {}).get("trading_capital", 0) > 0 else 0
+    if changed:
+        save_positions(positions, chat_id)
+
+def show_main_menu(chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if not user:
+        return
+    
+    exchange_text = user["exchange"].upper()
+    mode_text = "🎮 Demo" if user["is_demo"] else "💸 Real"
+    trade_text = user["trade_mode"].upper()
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "⚙️ Settings", "callback_data": f"settings_{chat_id}"}],
+            [{"text": "📊 Performance Report", "callback_data": f"report_{chat_id}"}],
+            [{"text": "🚦 Bot Status", "callback_data": f"status_{chat_id}"}],
+            [{"text": "🛑 Stop", "callback_data": f"stop_bot_{chat_id}"}, {"text": "🟢 Start", "callback_data": f"start_bot_{chat_id}"}]
+        ]
+    }
+    msg = f"""
+🤖 <b>Smart Trading Bot</b>
+🏦 Total Capital: <b>{user["total_wallet_balance"]:.2f} $</b>
+💼 Trading Capital: <b>{user["trading_capital"]:.2f} $</b>
+📝 Mode: <b>{mode_text}</b>
+📊 Market: <b>{trade_text}</b>
+🏦 Exchange: <b>{exchange_text}</b>
+"""
+    send_message(chat_id, msg, keyboard, bot_token=user["telegram_token"])
+
+def show_settings_menu(chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if not user:
+        return
+    
+    exchange_text = user["exchange"].upper()
+    mode_text = "🎮 Demo" if user["is_demo"] else "💸 Real"
+    trade_text = user["trade_mode"].upper()
+    text = f"""
+⚙️ <b>Settings Menu</b>
+🏦 Exchange: <b>{exchange_text}</b>
+📝 Mode: <b>{mode_text}</b>
+📊 Market: <b>{trade_text}</b>
+"""
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": f"🔄 Exchange: {exchange_text}", "callback_data": f"select_exchange_{chat_id}"}],
+            [{"text": f"🎮 Mode: {mode_text}", "callback_data": f"select_mode_{chat_id}"}],
+            [{"text": f"🌎 Market: {trade_text}", "callback_data": f"select_trade_mode_{chat_id}"}],
+            [{"text": "🔙 Back", "callback_data": f"main_menu_{chat_id}"}]
+        ]
+    }
+    send_message(chat_id, text, keyboard, bot_token=user["telegram_token"])
+
+def show_exchange_selection(chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if not user:
+        return
+    
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "Coinex", "callback_data": f"select_coinex_{chat_id}"}]
+        ]
+    }
+    send_message(chat_id, "Please select exchange:", keyboard, bot_token=user["telegram_token"])
+
+def show_mode_selection(chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if not user:
+        return
+    
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "🎮 Demo", "callback_data": f"mode_demo_{chat_id}"}],
+            [{"text": "💸 Real", "callback_data": f"mode_real_{chat_id}"}]
+        ]
+    }
+    send_message(chat_id, "Select trade mode:", keyboard, bot_token=user["telegram_token"])
+
+def show_trade_mode_selection(chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if not user:
+        return
+    
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "SPOT", "callback_data": f"trade_spot_{chat_id}"}],
+            [{"text": "FUTURES", "callback_data": f"trade_futures_{chat_id}"}]
+        ]
+    }
+    send_message(chat_id, "Select market type:", keyboard, bot_token=user["telegram_token"])
+
+def all_settings_completed(chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if not user:
+        return False
+    return (user["exchange"] is not None and
+            user["trade_mode"] is not None and
+            user["is_demo"] is not None and
+            user["total_wallet_balance"] is not None and
+            user["trading_capital"] is not None)
+
+def is_running_for_user(chat_id):
+    # اینجا می‌توانید منطقی برای بررسی وضعیت اجرا برای هر کاربر اضافه کنید
+    return True
+
+def send_performance_report(chat_id):
+    try:
+        users_data = load_users()
+        user = users_data.get(str(chat_id))
+        if not user:
+            send_message(chat_id, "⚠️ کاربر یافت نشد", bot_token=MAIN_BOT_TOKEN)
+            return
+        
+        positions = load_positions(chat_id)
+        wallet_balance = user["total_wallet_balance"]
+        trading_capital_stored = user["trading_capital"]
+        capital = trading_capital_stored
+        closed_positions = [p for p in positions.get("positions", []) if p.get("status") == "closed"]
+        open_positions = [p for p in positions.get("positions", []) if p.get("status") == "open"]
+        wins = sum(1 for p in closed_positions if p.get("profit_dollar", 0) > 0)
+        losses = sum(1 for p in closed_positions if p.get("profit_dollar", 0) < 0)
+        neutral = len([p for p in positions.get("positions", []) if p.get("profit_dollar", 0) == 0])
+        total = wins + losses + neutral
+        winrate = (wins / total * 100) if total > 0 else 0.0
+        total_pnl = sum(p.get("profit_dollar", 0.0) for p in closed_positions)
+        avg_pnl = total_pnl / len(closed_positions) if closed_positions else 0.0
+        report_summary = f"""
+📊 <b>Smart Trading Performance Report</b>
+📢 Total Trades: <b>{total}</b>
+✅ Profitable Trades: <b>{wins}</b>
+❌ Loss-making Trades: <b>{losses}</b>
+🔄 Neutral Trades: <b>{neutral}</b>
+🎯 Win Rate: <b>{winrate:.1f}%</b>
+💰 Total Capital: <b>{wallet_balance:.2f} $</b>
+💼 Trading Capital: <b>{trading_capital_stored:.2f} $</b>
+📈 Total P/L: <b>{total_pnl:.2f} $</b>
+📊 Avg P/L per Trade: <b>{avg_pnl:.2f} $</b>
+🏦 Current Capital: <b>{capital:.2f} $</b>
+📝 Open Positions: <b>{len(open_positions)}</b>
+📝 Closed Positions: <b>{len(closed_positions)}</b>
+"""
+        send_message(chat_id, report_summary, bot_token=user["telegram_token"])
+        
+        # ساخت چارت (کد ساخت چارت را می‌توانید از نسخه قبلی کپی کنید)
+        # ...
+        
+        send_message(chat_id, "✅ گزارش عملکرد کامل با چارت‌های ترکیبی ارسال شد.", bot_token=user["telegram_token"])
+    except Exception as e:
+        error_msg = f"⚠️ خطا در تولید گزارش عملکرد: {str(e)}"
+        logger.error(error_msg)
+        send_message(chat_id, error_msg, bot_token=MAIN_BOT_TOKEN)
+
+def show_status(chat_id):
+    users_data = load_users()
+    user = users_data.get(str(chat_id))
+    if not user:
+        send_message(chat_id, "⚠️ کاربر یافت نشد", bot_token=MAIN_BOT_TOKEN)
+        return
+    
+    positions = load_positions(chat_id)
+    capital = positions.get("capital") or user["trading_capital"]
+    wins = sum(1 for p in positions.get("positions", []) if p.get("status") == "closed" and p.get("profit_dollar", 0) > 0)
+    losses = sum(1 for p in positions.get("positions", []) if p.get("status") == "closed" and p.get("profit_dollar", 0) < 0)
+    total = wins + losses
+    winrate = (wins / total * 100) if total > 0 else 0
+    realized_pnl = sum(p.get("profit_dollar", 0.0) for p in positions.get("positions", []))
+    current_capital_value = user["trading_capital"] + realized_pnl
+    status = "🟢 Active" if is_running_for_user(chat_id) else "🔴 Stopped"
+    msg = f"""
+🚦 <b>Smart Bot Status</b>
+{status}
+🏦 Total Capital: <b>{user["total_wallet_balance"]:.2f} $</b>
+💼 Trading Capital: <b>{user["trading_capital"]:.2f} $</b>
+📈 Trades: {total} (✅{wins} / ❌{losses})
+🎯 Win Rate: <b>{winrate:.1f}%</b>
+📈 Total PNL: <b>{realized_pnl:.2f} $</b>
+💰 Current Capital: <b>{current_capital_value:.2f} $</b>
+🔄 Current Symbol: <b>{current_symbol or 'None'}</b>
+"""
+    keyboard = {"inline_keyboard": [[{"text": "🔙 Main Menu", "callback_data": f"main_menu_{chat_id}"}]]}
+    send_message(chat_id, msg, keyboard, bot_token=user["telegram_token"])
+
+def handle_telegram_messages():
+    users = load_users()
+    user_state = {}  # برای ذخیره وضعیت ورود کاربر (موقت در حافظه)
+    last_update_id = 0
+    
+    while True:
+        try:
+            resp = requests.get(f"https://api.telegram.org/bot{MAIN_BOT_TOKEN}/getUpdates?offset={last_update_id}&timeout=30", timeout=40)
+            if not resp.ok:
+                logger.error(f"Telegram update error: {resp.text}")
+                time.sleep(5)
+                continue
+                
+            data = resp.json()
+            if "result" not in data or not data["result"]:
+                time.sleep(1)
+                continue
+                
+            for update in data["result"]:
+                last_update_id = update["update_id"] + 1
+                if "message" in update and "text" in update["message"]:
+                    text = update["message"]["text"].strip()
+                    chat_id = str(update["message"]["chat"]["id"])
+                    user_data = users.get(chat_id)
+                    
+                    # اگر کاربر جدید است و در حال راه‌اندازی اولیه است
+                    if not user_data:
+                        if text == "/start":
+                            send_message(chat_id, "✅ سلام! برای شروع، لطفاً اطلاعات زیر را به ترتیب ارسال کنید:\n\n1. توکن بات تلگرام خود را وارد کنید (مثل: `123456789:ABCdefGhIJKlmnoPqrStUvWxYz`)\n2. Chat ID خود را وارد کنید (مثل: `153873572`)\n3. صرافی مورد نظر (coinex/binance)\n4. API Key\n5. Secret Key\n6. حالت معامله (spot/futures)\n7. حالت تست (demo/real)\n8. موجودی کل (دلار)\n9. سرمایه معاملاتی (دلار)\n\nلطفاً این 9 مورد را یکی یکی به صورت متنی ارسال کنید.", bot_token=MAIN_BOT_TOKEN)
+                            user_state[chat_id] = {"step": 1, "data": {}}
+                            continue
+
+                        if chat_id in user_state:
+                            step = user_state[chat_id]["step"]
+                            data = user_state[chat_id]["data"]
+
+                            if step == 1:
+                                data["bot_token"] = text
+                                send_message(chat_id, "✅ توکن بات ثبت شد. حالا Chat ID خود را وارد کنید.", bot_token=MAIN_BOT_TOKEN)
+                                user_state[chat_id]["step"] = 2
+                            elif step == 2:
+                                data["chat_id"] = text
+                                send_message(chat_id, "✅ Chat ID ثبت شد. حالا صرافی را وارد کنید (coinex/binance)", bot_token=MAIN_BOT_TOKEN)
+                                user_state[chat_id]["step"] = 3
+                            elif step == 3:
+                                if text.lower() not in ["coinex", "binance"]:
+                                    send_message(chat_id, "❌ صرافی باید coinex یا binance باشد. دوباره وارد کنید.", bot_token=MAIN_BOT_TOKEN)
+                                    continue
+                                data["exchange"] = text.lower()
+                                send_message(chat_id, "✅ صرافی ثبت شد. حالا API Key خود را وارد کنید.", bot_token=MAIN_BOT_TOKEN)
+                                user_state[chat_id]["step"] = 4
+                            elif step == 4:
+                                data["api_key"] = text
+                                send_message(chat_id, "✅ API Key ثبت شد. حالا Secret Key را وارد کنید.", bot_token=MAIN_BOT_TOKEN)
+                                user_state[chat_id]["step"] = 5
+                            elif step == 5:
+                                data["api_secret"] = text
+                                send_message(chat_id, "✅ Secret Key ثبت شد. حالا حالت معامله را وارد کنید (spot/futures)", bot_token=MAIN_BOT_TOKEN)
+                                user_state[chat_id]["step"] = 6
+                            elif step == 6:
+                                if text.lower() not in ["spot", "futures"]:
+                                    send_message(chat_id, "❌ حالت باید spot یا futures باشد.", bot_token=MAIN_BOT_TOKEN)
+                                    continue
+                                data["trade_mode"] = text.lower()
+                                send_message(chat_id, "✅ حالت معامله ثبت شد. حالا حالت تست را وارد کنید (demo/real)", bot_token=MAIN_BOT_TOKEN)
+                                user_state[chat_id]["step"] = 7
+                            elif step == 7:
+                                if text.lower() not in ["demo", "real"]:
+                                    send_message(chat_id, "❌ حالت باید demo یا real باشد.", bot_token=MAIN_BOT_TOKEN)
+                                    continue
+                                data["is_demo"] = (text.lower() == "demo")
+                                send_message(chat_id, "✅ حالت تست ثبت شد. حالا موجودی کل (دلار) را وارد کنید.", bot_token=MAIN_BOT_TOKEN)
+                                user_state[chat_id]["step"] = 8
+                            elif step == 8:
+                                try:
+                                    data["total_wallet_balance"] = float(text)
+                                    send_message(chat_id, "✅ موجودی کل ثبت شد. حالا سرمایه معاملاتی (دلار) را وارد کنید.", bot_token=MAIN_BOT_TOKEN)
+                                    user_state[chat_id]["step"] = 9
+                                except:
+                                    send_message(chat_id, "❌ لطفا یک عدد معتبر وارد کنید.", bot_token=MAIN_BOT_TOKEN)
+                            elif step == 9:
+                                try:
+                                    data["trading_capital"] = float(text)
+                                    # ذخیره کاربر در users.json
+                                    users[chat_id] = data
+                                    save_users(users)
+                                    del user_state[chat_id]
+                                    send_message(chat_id, "🎉 تنظیمات شما با موفقیت ثبت شد!\n\nربات شما آماده است.\n\nبرای مشاهده منو، /start را بزنید.", bot_token=MAIN_BOT_TOKEN)
+                                    show_main_menu(chat_id)
+                                except:
+                                    send_message(chat_id, "❌ لطفا یک عدد معتبر وارد کنید.", bot_token=MAIN_BOT_TOKEN)
+                    else:
+                        # کاربر قبلاً تنظیماتش را کرده
+                        if text == "/start":
+                            show_main_menu(chat_id)
+                        elif text == "/report":
+                            send_performance_report(chat_id)
+                        elif text == "/status":
+                            show_status(chat_id)
+                if "callback_query" in update:
+                    cd = update["callback_query"]["data"]
+                    chat_id = str(update["callback_query"]["message"]["chat"]["id"])
+                    if cd.startswith("main_menu_"):
+                        show_main_menu(chat_id)
+                    elif cd.startswith("settings_"):
+                        show_settings_menu(chat_id)
+                    elif cd.startswith("report_"):
+                        send_performance_report(chat_id)
+                    elif cd.startswith("status_"):
+                        show_status(chat_id)
+                    elif cd.startswith("stop_bot_"):
+                        # اینجا می‌توانید منطق متوقف کردن ربات برای کاربر خاص را اضافه کنید
+                        send_message(chat_id, "🛑 ربات متوقف شد.", bot_token=load_users().get(str(chat_id), {}).get("telegram_token"))
+                    elif cd.startswith("start_bot_"):
+                        # اینجا می‌توانید منطق شروع ربات برای کاربر خاص را اضافه کنید
+                        send_message(chat_id, "🟢 ربات هوشمند شروع شد.", bot_token=load_users().get(str(chat_id), {}).get("telegram_token"))
+                    elif cd.startswith("select_exchange_"):
+                        show_exchange_selection(chat_id)
+                    elif cd.startswith("select_mode_"):
+                        show_mode_selection(chat_id)
+                    elif cd.startswith("select_trade_mode_"):
+                        show_trade_mode_selection(chat_id)
+                    elif cd.startswith("select_coinex_"):
+                        # ذخیره انتخاب صرافی
+                        users = load_users()
+                        user = users.get(chat_id)
+                        if user:
+                            user["exchange"] = "coinex"
+                            save_users(users)
+                            send_message(chat_id, "✅ صرافی انتخاب شد: CoinEx", bot_token=user["telegram_token"])
+                            show_settings_menu(chat_id)
+                    # ... سایر دستورات ...
+        except Exception as e:
+            logger.error(f"Telegram message handling error: {e}")
+            time.sleep(1)
+
+# ===============================
+# 12. حلقه اصلی
+# ===============================
+def main_loop():
+    global is_running
+    threading.Thread(target=handle_telegram_messages, daemon=True).start()
+    
+    while True:
+        try:
+            users = load_users()
+            for chat_id, user_data in users.items():
+                if all_settings_completed(chat_id) and is_running_for_user(chat_id):
+                    smart_bot = SmartTradingBot(chat_id)
+                    if smart_bot.initialize():
+                        smart_bot.run_cycle()
+            
+            time.sleep(300)  # هر 5 دقیقه یک بار چک کن
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+            time.sleep(2)
+
+# ===============================
+# شروع برنامه
+# ===============================
+if __name__ == "__main__":
+    logger.info("🚀 Smart Trading Bot starting...")
+    main_loop()

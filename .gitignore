@@ -1,0 +1,12 @@
+# حذف فایل‌های حساس
+users.json
+*.env
+*.pyc
+__pycache__/
+positions_*.json
+
+# فایل‌های مربوط به محیط‌های توسعه
+.env
+.env.local
+.env.development
+.env.production
